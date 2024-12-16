@@ -5,7 +5,7 @@ use ethers::{
     prelude::*,
     providers::{Provider, Ws},
     signers::{LocalWallet, Signer},
-    types::*,
+    types::U256,
 };
 use eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -83,17 +83,30 @@ impl AirdropState {
     }
 }
 
+async fn is_gas_price_acceptable(provider: &Provider<Ws>) -> Result<bool> {
+    let gas_price = provider.get_gas_price().await?;
+    // Convert to Gwei for easier comparison (1 Gwei = 10^9 wei)
+    let gas_price_gwei = gas_price / U256::exp10(9);
+    println!("Current gas price: {} gwei", gas_price_gwei);
+    
+    // Only proceed if gas price is below 0.1 gwei (0.1 * 10^9 wei)
+    let max_gas_price = U256::from(100_000_000); // 0.1 gwei in wei
+    Ok(gas_price <= max_gas_price)
+}
+
 async fn send_airdrop(
     token: &IERC20<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     recipient: Address,
     amount: U256,
     gas_price: U256,
 ) -> Result<H256> {
-    let tx = token.transfer(recipient, amount)
-        .legacy()
+    // Build the transaction
+    let tx_call = token.transfer(recipient, amount);
+    let tx = tx_call
         .gas(U256::from(500000))
         .gas_price(gas_price);
 
+    // Send the transaction
     let pending_tx = tx.send().await?;
     Ok(pending_tx.tx_hash())
 }
@@ -133,6 +146,7 @@ async fn main() -> Result<()> {
     let mut stream = event.stream().await?;
 
     println!("🎯 Monitoring for new liquidity provisions...");
+    println!("⛽ Will only send transactions when gas price is below 0.1 gwei");
 
     while let Some(Ok(event)) = stream.next().await {
         println!("🔥 New liquidity added!");
@@ -154,26 +168,39 @@ async fn main() -> Result<()> {
                 // Send airdrop (100 tokens with 18 decimals)
                 let amount = U256::from(100_000_000_000_000_000_000u128);
 
-                // Get current gas price and estimate gas
-                let gas_price = provider.get_gas_price().await?;
-                println!("Current gas price: {} gwei", gas_price / U256::exp10(9));
-
-                // Send the airdrop
-                match send_airdrop(&airdrop_token, owner, amount, gas_price).await {
-                    Ok(tx_hash) => {
-                        println!("✅ Airdrop sent to {}! Transaction: {:?}", owner_str, tx_hash);
+                // Check gas price and wait if it's too high
+                let mut attempts = 0;
+                while attempts < 10 {
+                    if is_gas_price_acceptable(&provider).await? {
+                        let gas_price = provider.get_gas_price().await?;
                         
-                        // Record the airdrop
-                        airdrop_state.record_airdrop(
-                            owner_str,
-                            amount.to_string(),
-                            format!("{:?}", tx_hash),
-                        );
+                        // Send the airdrop
+                        match send_airdrop(&airdrop_token, owner, amount, gas_price).await {
+                            Ok(tx_hash) => {
+                                println!("✅ Airdrop sent to {}! Transaction: {:?}", owner_str, tx_hash);
+                                
+                                // Record the airdrop
+                                airdrop_state.record_airdrop(
+                                    owner_str,
+                                    amount.to_string(),
+                                    format!("{:?}", tx_hash),
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                println!("❌ Failed to send airdrop: {:?}", e);
+                                println!("💡 Make sure you have enough ETH in your wallet for gas fees!");
+                            }
+                        }
+                    } else {
+                        println!("⏳ Gas price too high, waiting 5 minutes before retrying...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                        attempts += 1;
                     }
-                    Err(e) => {
-                        println!("❌ Failed to send airdrop: {:?}", e);
-                        println!("💡 Make sure you have enough ETH in your wallet for gas fees!");
-                    }
+                }
+                
+                if attempts >= 10 {
+                    println!("⚠️ Could not find acceptable gas price after 10 attempts, skipping this airdrop");
                 }
             }
             Err(e) => {
