@@ -88,12 +88,12 @@ async fn get_minimum_gas_price(provider: &Provider<Ws>) -> Result<U256> {
     let block = provider.get_block(BlockNumber::Latest).await?.unwrap();
     let base_fee = block.base_fee_per_gas.unwrap_or_default();
     
-    // Add 1% to base fee to ensure it passes
-    // This is still extremely low but will work
-    let gas_price = base_fee + (base_fee / 100);
+    // Add just 0.5% to base fee
+    // This is extremely aggressive but should still work
+    let gas_price = base_fee + (base_fee / 200);
     
     println!("📊 Current base fee: {} gwei", base_fee / U256::exp10(9));
-    println!("📊 Using gas price: {} gwei", gas_price / U256::exp10(9));
+    println!("📊 Using gas price: {} gwei (base_fee + 0.5%)", gas_price / U256::exp10(9));
     
     Ok(gas_price)
 }
