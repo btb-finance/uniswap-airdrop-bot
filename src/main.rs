@@ -83,15 +83,34 @@ impl AirdropState {
     }
 }
 
-async fn is_gas_price_acceptable(provider: &Provider<Ws>) -> Result<bool> {
-    let gas_price = provider.get_gas_price().await?;
-    // Convert to Gwei for easier comparison (1 Gwei = 10^9 wei)
-    let gas_price_gwei = gas_price / U256::exp10(9);
-    println!("Current gas price: {} gwei", gas_price_gwei);
+async fn get_minimum_gas_price(provider: &Provider<Ws>) -> Result<U256> {
+    // Get the current base fee
+    let block = provider.get_block(BlockNumber::Latest).await?.unwrap();
+    let base_fee = block.base_fee_per_gas.unwrap_or_default();
     
-    // Only proceed if gas price is below 0.1 gwei (0.1 * 10^9 wei)
-    let max_gas_price = U256::from(100_000_000); // 0.1 gwei in wei
-    Ok(gas_price <= max_gas_price)
+    // Add 1% to base fee to ensure it passes
+    // This is still extremely low but will work
+    let gas_price = base_fee + (base_fee / 100);
+    
+    println!("📊 Current base fee: {} gwei", base_fee / U256::exp10(9));
+    println!("📊 Using gas price: {} gwei", gas_price / U256::exp10(9));
+    
+    Ok(gas_price)
+}
+
+async fn estimate_minimum_gas(
+    token: &IERC20<SignerMiddleware<Provider<Ws>, LocalWallet>>,
+    recipient: Address,
+    amount: U256,
+) -> Result<U256> {
+    // Get the exact gas estimate
+    let gas_estimate = token
+        .transfer(recipient, amount)
+        .estimate_gas()
+        .await?;
+    
+    // Add just 2% buffer - on Arbitrum this is usually enough
+    Ok(gas_estimate + (gas_estimate / 50))
 }
 
 async fn send_airdrop(
@@ -99,14 +118,16 @@ async fn send_airdrop(
     recipient: Address,
     amount: U256,
     gas_price: U256,
+    gas_limit: U256,
 ) -> Result<H256> {
-    // Build the transaction
     let tx_call = token.transfer(recipient, amount);
+    
+    // Use legacy transaction type which often uses less gas
     let tx = tx_call
-        .gas(U256::from(500000))
-        .gas_price(gas_price);
+        .gas(gas_limit)
+        .gas_price(gas_price)
+        .legacy();
 
-    // Send the transaction
     let pending_tx = tx.send().await?;
     Ok(pending_tx.tx_hash())
 }
@@ -146,7 +167,7 @@ async fn main() -> Result<()> {
     let mut stream = event.stream().await?;
 
     println!("🎯 Monitoring for new liquidity provisions...");
-    println!("⛽ Will only send transactions when gas price is below 0.1 gwei");
+    println!("⛽ Using absolute minimum gas (0.001 gwei) for Arbitrum");
 
     while let Some(Ok(event)) = stream.next().await {
         println!("🔥 New liquidity added!");
@@ -168,39 +189,31 @@ async fn main() -> Result<()> {
                 // Send airdrop (100 tokens with 18 decimals)
                 let amount = U256::from(100_000_000_000_000_000_000u128);
 
-                // Check gas price and wait if it's too high
-                let mut attempts = 0;
-                while attempts < 10 {
-                    if is_gas_price_acceptable(&provider).await? {
-                        let gas_price = provider.get_gas_price().await?;
-                        
-                        // Send the airdrop
-                        match send_airdrop(&airdrop_token, owner, amount, gas_price).await {
-                            Ok(tx_hash) => {
-                                println!("✅ Airdrop sent to {}! Transaction: {:?}", owner_str, tx_hash);
-                                
-                                // Record the airdrop
-                                airdrop_state.record_airdrop(
-                                    owner_str,
-                                    amount.to_string(),
-                                    format!("{:?}", tx_hash),
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                println!("❌ Failed to send airdrop: {:?}", e);
-                                println!("💡 Make sure you have enough ETH in your wallet for gas fees!");
-                            }
-                        }
-                    } else {
-                        println!("⏳ Gas price too high, waiting 5 minutes before retrying...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
-                        attempts += 1;
-                    }
-                }
+                // Get the minimum viable gas price and limit
+                let gas_price = get_minimum_gas_price(&provider).await?;
+                let gas_limit = estimate_minimum_gas(&airdrop_token, owner, amount).await?;
                 
-                if attempts >= 10 {
-                    println!("⚠️ Could not find acceptable gas price after 10 attempts, skipping this airdrop");
+                println!("💡 Using minimum gas price: {} gwei", gas_price / U256::exp10(9));
+                println!("💡 Estimated gas limit: {}", gas_limit);
+
+                // Send the airdrop with minimum viable gas
+                match send_airdrop(&airdrop_token, owner, amount, gas_price, gas_limit).await {
+                    Ok(tx_hash) => {
+                        println!("✅ Airdrop sent to {}! Transaction: {:?}", owner_str, tx_hash);
+                        println!("💰 Used gas price: {} gwei", gas_price / U256::exp10(9));
+                        println!("⚡ Used gas limit: {}", gas_limit);
+                        
+                        // Record the airdrop
+                        airdrop_state.record_airdrop(
+                            owner_str,
+                            amount.to_string(),
+                            format!("{:?}", tx_hash),
+                        );
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to send airdrop: {:?}", e);
+                        println!("💡 Make sure you have enough ETH in your wallet for gas fees!");
+                    }
                 }
             }
             Err(e) => {
